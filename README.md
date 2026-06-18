@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/banner.png" alt="session-sync banner">
+</p>
+
 # session-sync
 
 Migrate chat sessions between **Claude Code**, **VS Code Copilot Chat**, and **OpenCode** — in all six directions — without touching the source.
