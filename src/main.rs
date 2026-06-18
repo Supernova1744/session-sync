@@ -43,8 +43,9 @@ fn run() -> Result<()> {
             from,
             to,
             session,
+            dir,
             out_dir,
-        } => cmd_convert(&from, &to, session, out_dir),
+        } => cmd_convert(&from, &to, session, dir, out_dir),
     }
 }
 
@@ -117,13 +118,14 @@ fn cmd_convert(
     from: &Tool,
     to: &Tool,
     session_id: Option<String>,
+    dir: Option<PathBuf>,
     out_dir: Option<PathBuf>,
 ) -> Result<()> {
     if from == to {
         return Err(anyhow!("Source and target tools must be different"));
     }
 
-    let reader = make_reader(from, None)?;
+    let reader = make_reader(from, dir.as_deref())?;
     let sessions = reader.list_sessions()?;
 
     if sessions.is_empty() {
