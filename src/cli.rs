@@ -36,6 +36,12 @@ pub enum Command {
         /// Session ID to convert; omit for interactive picker
         #[arg(long)]
         session: Option<String>,
+        /// Override the source tool's storage location (same meaning as
+        /// `list --dir`). Per --from: claude expects the ~/.claude/projects dir;
+        /// opencode expects a dir containing opencode.db; vscode expects the
+        /// workspaceStorage dir.
+        #[arg(long)]
+        dir: Option<PathBuf>,
         /// Override the target tool's output location (defaults to its native
         /// storage). Per --to: claude expects the ~/.claude/projects dir; opencode
         /// expects a dir containing opencode.db (or the opencode.db file path);
