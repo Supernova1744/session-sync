@@ -1,11 +1,14 @@
 use std::path::PathBuf;
 
 use anyhow::Context;
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection, OpenFlags};
 use serde_json::Value;
 
 use crate::error::{anyhow, Result};
-use crate::ir::{AssistantMessage, AssistantPart, Session, ThinkingBlock, ToolCall, Turn, TokenUsage, UserMessage};
+use crate::ir::{
+    AssistantMessage, AssistantPart, Session, ThinkingBlock, TokenUsage, ToolCall, Turn,
+    UserMessage,
+};
 use crate::loss::{LossKind, LossReport};
 use crate::readers::{Reader, SessionSummary};
 
@@ -19,9 +22,15 @@ impl OpenCodeReader {
     }
 
     fn open(&self) -> Result<Connection> {
-        let conn = Connection::open(&self.db_path)
-            .with_context(|| format!("opening OpenCode DB: {}", self.db_path.display()))?;
-        conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")?;
+        // Open the source DB read-only: we must never mutate the user's data
+        // (the README promises the source is untouched), and read-only also
+        // avoids creating -wal/-shm sidecars and works on read-only filesystems.
+        let conn = Connection::open_with_flags(
+            &self.db_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("opening OpenCode DB read-only: {}", self.db_path.display()))?;
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         Ok(conn)
     }
 }
@@ -35,14 +44,22 @@ impl Reader for OpenCodeReader {
              ORDER BY time_updated DESC",
         )?;
         let rows = stmt.query_map([], |row| {
+            // title/directory may be NULL for untitled/uncoded sessions; reading
+            // them as Option avoids discarding the whole row (which previously
+            // made such sessions silently vanish from the listing).
             Ok(SessionSummary {
-                id:         row.get::<_, String>(0)?,
-                title:      row.get::<_, String>(1)?,
-                cwd:        row.get::<_, String>(2)?,
+                id: row.get::<_, String>(0)?,
+                title: row
+                    .get::<_, Option<String>>(1)?
+                    .unwrap_or_else(|| "(untitled)".to_string()),
+                cwd: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
                 updated_ms: row.get::<_, i64>(3)?,
             })
         })?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        let summaries = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("reading session list from OpenCode DB")?;
+        Ok(summaries)
     }
 
     fn read_session(&self, id: &str) -> Result<Session> {
@@ -59,24 +76,29 @@ impl Reader for OpenCodeReader {
 
         let _ = project_id; // not needed for IR
 
-        // Load messages ordered by time_created
+        let mut losses = LossReport::default();
+
+        // Load messages ordered by time_created. DB-row errors are propagated;
+        // a single message with malformed `data` JSON is recorded as a loss and
+        // skipped rather than dropping it silently.
         let mut msg_stmt = conn.prepare(
             "SELECT id, data FROM message WHERE session_id = ?1 ORDER BY time_created ASC",
         )?;
-        let messages: Vec<(String, Value)> = msg_stmt
-            .query_map(params![id], |row| {
-                let data_str: String = row.get(1)?;
-                Ok((row.get::<_, String>(0)?, data_str))
-            })?
-            .filter_map(|r| r.ok())
-            .filter_map(|(mid, data_str)| {
-                serde_json::from_str::<Value>(&data_str)
-                    .ok()
-                    .map(|v| (mid, v))
-            })
-            .collect();
-
-        let mut losses = LossReport::default();
+        let mut messages: Vec<(String, Value)> = Vec::new();
+        let rows = msg_stmt.query_map(params![id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for r in rows {
+            let (mid, data_str) = r.context("reading message row from OpenCode DB")?;
+            match serde_json::from_str::<Value>(&data_str) {
+                Ok(v) => messages.push((mid, v)),
+                Err(_) => losses.add(
+                    LossKind::UnsupportedPartType,
+                    1,
+                    Some(format!("malformed message data JSON: {mid}")),
+                ),
+            }
+        }
         let mut turns: Vec<Turn> = vec![];
         let mut i = 0;
 
@@ -137,17 +159,22 @@ impl Reader for OpenCodeReader {
             }
 
             turns.push(Turn {
-                user: UserMessage { created_ms: user_created_ms, text: user_text },
+                user: UserMessage {
+                    created_ms: user_created_ms,
+                    text: user_text,
+                },
                 assistant: asst_msg,
             });
         }
 
         // Check for todos
-        let todo_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM todo WHERE session_id = ?1",
-            params![id],
-            |r| r.get(0),
-        ).unwrap_or(0);
+        let todo_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM todo WHERE session_id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
         if todo_count > 0 {
             losses.add(LossKind::OpenCodeTodos, todo_count as usize, None);
         }
@@ -169,7 +196,9 @@ fn load_user_text(conn: &Connection, message_id: &str, session_id: &str) -> Resu
         "SELECT data FROM part WHERE message_id = ?1 AND session_id = ?2 ORDER BY time_created ASC",
     )?;
     let parts: Vec<Value> = stmt
-        .query_map(params![message_id, session_id], |row| row.get::<_, String>(0))?
+        .query_map(params![message_id, session_id], |row| {
+            row.get::<_, String>(0)
+        })?
         .filter_map(|r| r.ok())
         .filter_map(|s| serde_json::from_str::<Value>(&s).ok())
         .collect();
@@ -198,7 +227,9 @@ fn load_assistant_parts(
         "SELECT data FROM part WHERE message_id = ?1 AND session_id = ?2 ORDER BY time_created ASC",
     )?;
     let parts: Vec<Value> = stmt
-        .query_map(params![message_id, session_id], |row| row.get::<_, String>(0))?
+        .query_map(params![message_id, session_id], |row| {
+            row.get::<_, String>(0)
+        })?
         .filter_map(|r| r.ok())
         .filter_map(|s| serde_json::from_str::<Value>(&s).ok())
         .collect();
@@ -262,10 +293,10 @@ fn parse_tokens(v: &Value) -> Option<TokenUsage> {
         return None;
     }
     Some(TokenUsage {
-        input:       v["input"].as_i64().unwrap_or(0),
-        output:      v["output"].as_i64().unwrap_or(0),
-        reasoning:   v["reasoning"].as_i64().unwrap_or(0),
-        cache_read:  v["cache"]["read"].as_i64().unwrap_or(0),
+        input: v["input"].as_i64().unwrap_or(0),
+        output: v["output"].as_i64().unwrap_or(0),
+        reasoning: v["reasoning"].as_i64().unwrap_or(0),
+        cache_read: v["cache"]["read"].as_i64().unwrap_or(0),
         cache_write: v["cache"]["write"].as_i64().unwrap_or(0),
     })
 }

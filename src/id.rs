@@ -23,15 +23,15 @@ pub fn new_part_id(created_ms: i64) -> String {
 }
 
 const ADJECTIVES: &[&str] = &[
-    "misty", "swift", "lucky", "bright", "calm", "amber", "neon", "fuzzy",
-    "nimble", "witty", "peppy", "vivid", "bold", "crisp", "grand", "noble",
-    "wild", "sleek", "vast", "keen", "warm", "cool", "fresh", "gentle",
+    "misty", "swift", "lucky", "bright", "calm", "amber", "neon", "fuzzy", "nimble", "witty",
+    "peppy", "vivid", "bold", "crisp", "grand", "noble", "wild", "sleek", "vast", "keen", "warm",
+    "cool", "fresh", "gentle",
 ];
 
 const NOUNS: &[&str] = &[
-    "moon", "river", "canyon", "storm", "peak", "engine", "eagle", "orchid",
-    "squid", "panda", "thunder", "comet", "forest", "harbor", "bridge", "flame",
-    "dawn", "ridge", "tide", "grove", "haze", "spark", "cloud", "drift",
+    "moon", "river", "canyon", "storm", "peak", "engine", "eagle", "orchid", "squid", "panda",
+    "thunder", "comet", "forest", "harbor", "bridge", "flame", "dawn", "ridge", "tide", "grove",
+    "haze", "spark", "cloud", "drift",
 ];
 
 pub fn new_slug() -> String {
@@ -60,7 +60,9 @@ mod tests {
 
     #[test]
     fn ids_are_unique() {
-        let ids: HashSet<_> = (0..200).map(|_| new_message_id(1_700_000_000_000)).collect();
+        let ids: HashSet<_> = (0..200)
+            .map(|_| new_message_id(1_700_000_000_000))
+            .collect();
         assert_eq!(ids.len(), 200);
     }
 

@@ -2,12 +2,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 
 use crate::discover::decode_vscode_folder_uri;
 use crate::error::{anyhow, Result};
-use crate::ir::{AssistantMessage, AssistantPart, Session, ThinkingBlock, ToolCall, Turn, UserMessage};
+use crate::ir::{
+    AssistantMessage, AssistantPart, Session, ThinkingBlock, ToolCall, Turn, UserMessage,
+};
 use crate::loss::{LossKind, LossReport};
 use crate::readers::{Reader, SessionSummary};
 
@@ -17,16 +19,27 @@ pub struct VsCodeReader {
 
 impl VsCodeReader {
     pub fn new(workspace_storage_dirs: Vec<PathBuf>) -> Self {
-        Self { workspace_storage_dirs }
+        Self {
+            workspace_storage_dirs,
+        }
     }
 
     /// Find which hash dir contains the given session UUID (checks .jsonl then .json).
     fn find_hash_dir(&self, session_id: &str) -> Option<PathBuf> {
         for ws_dir in &self.workspace_storage_dirs {
-            for entry in fs::read_dir(ws_dir).ok()?.flatten() {
+            // `continue` (not `?`) so an unreadable ws_dir doesn't abort the
+            // search across the remaining workspace storage directories.
+            let Ok(entries) = fs::read_dir(ws_dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
                 let chat_sessions_dir = entry.path().join("chatSessions");
-                if chat_sessions_dir.join(format!("{}.jsonl", session_id)).exists()
-                    || chat_sessions_dir.join(format!("{}.json", session_id)).exists()
+                if chat_sessions_dir
+                    .join(format!("{}.jsonl", session_id))
+                    .exists()
+                    || chat_sessions_dir
+                        .join(format!("{}.json", session_id))
+                        .exists()
                 {
                     return Some(entry.path());
                 }
@@ -52,18 +65,7 @@ impl Reader for VsCodeReader {
                     continue;
                 }
 
-                let workspace_json = hash_dir.join("workspace.json");
-                let cwd = if workspace_json.exists() {
-                    let content = fs::read_to_string(&workspace_json).unwrap_or_default();
-                    let v: Value = serde_json::from_str(&content).unwrap_or(Value::Null);
-                    v["folder"]
-                        .as_str()
-                        .and_then(|uri| decode_vscode_folder_uri(uri))
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .unwrap_or_default()
-                } else {
-                    String::new()
-                };
+                let cwd = read_cwd(&hash_dir);
 
                 let db_path = hash_dir.join("state.vscdb");
                 if !db_path.exists() {
@@ -92,20 +94,12 @@ impl Reader for VsCodeReader {
     }
 
     fn read_session(&self, id: &str) -> Result<Session> {
+        crate::readers::validate_session_id(id)?;
         let hash_dir = self
             .find_hash_dir(id)
             .ok_or_else(|| anyhow!("VS Code session not found: {}", id))?;
 
-        let cwd = {
-            let workspace_json = hash_dir.join("workspace.json");
-            let content = fs::read_to_string(&workspace_json).unwrap_or_default();
-            let v: Value = serde_json::from_str(&content).unwrap_or(Value::Null);
-            v["folder"]
-                .as_str()
-                .and_then(|uri| decode_vscode_folder_uri(uri))
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        };
+        let cwd = read_cwd(&hash_dir);
 
         let chat_dir = hash_dir.join("chatSessions");
 
@@ -125,8 +119,27 @@ impl Reader for VsCodeReader {
     }
 }
 
+/// Read a workspace's `folder` URI from its `workspace.json` and decode it to a
+/// local filesystem path. Returns an empty string when the file is missing,
+/// unreadable, or has no `folder` field.
+fn read_cwd(hash_dir: &Path) -> String {
+    let workspace_json = hash_dir.join("workspace.json");
+    let content = fs::read_to_string(&workspace_json).unwrap_or_default();
+    let v: Value = serde_json::from_str(&content).unwrap_or(Value::Null);
+    v["folder"]
+        .as_str()
+        .and_then(decode_vscode_folder_uri)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
 fn read_session_index(db_path: &Path) -> Result<Vec<SessionSummary>> {
-    let conn = Connection::open(db_path)?;
+    // Open read-only: this is the user's live VS Code DB; never create or write it.
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("opening state.vscdb read-only: {}", db_path.display()))?;
     let value: Option<String> = conn
         .query_row(
             "SELECT value FROM ItemTable WHERE key = 'chat.ChatSessionStore.index'",
@@ -148,10 +161,10 @@ fn read_session_index(db_path: &Path) -> Result<Vec<SessionSummary>> {
     Ok(entries
         .values()
         .map(|e| SessionSummary {
-            id:         e["sessionId"].as_str().unwrap_or("").to_string(),
-            title:      e["title"].as_str().unwrap_or("(untitled)").to_string(),
+            id: e["sessionId"].as_str().unwrap_or("").to_string(),
+            title: e["title"].as_str().unwrap_or("(untitled)").to_string(),
             updated_ms: e["lastMessageDate"].as_i64().unwrap_or(0),
-            cwd:        String::new(),
+            cwd: String::new(),
         })
         .filter(|s| !s.id.is_empty())
         .collect())
@@ -174,7 +187,20 @@ fn parse_vscode_jsonl(content: &str, session_id: &str, cwd: &str) -> Result<Sess
         if line.is_empty() {
             continue;
         }
-        let obj: Value = serde_json::from_str(line)?;
+        let obj: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => {
+                // Tolerate a single malformed line (e.g. a truncated trailing
+                // line in an append-only JSONL) instead of aborting the whole
+                // session parse. Mirrors the Claude reader's policy.
+                losses.add(
+                    LossKind::UnsupportedPartType,
+                    1,
+                    Some("malformed JSONL line".to_string()),
+                );
+                continue;
+            }
+        };
         let kind = obj["kind"].as_i64().unwrap_or(-1);
 
         match kind {
@@ -243,7 +269,11 @@ fn parse_vscode_jsonl(content: &str, session_id: &str, cwd: &str) -> Result<Sess
     }
 
     if !turns.is_empty() {
-        losses.add(LossKind::TokenCounts, 1, Some("VS Code doesn't store raw token counts".to_string()));
+        losses.add(
+            LossKind::TokenCounts,
+            1,
+            Some("VS Code doesn't store raw token counts".to_string()),
+        );
     }
 
     Ok(Session {
@@ -284,7 +314,10 @@ fn parse_request_turn(req: &Value, fallback_ms: i64, losses: &mut LossReport) ->
     };
 
     Some(Turn {
-        user: UserMessage { created_ms: user_created_ms, text: user_text },
+        user: UserMessage {
+            created_ms: user_created_ms,
+            text: user_text,
+        },
         assistant,
     })
 }
@@ -333,13 +366,20 @@ fn parse_vscode_session_json(v: &Value, session_id: &str, cwd: &str) -> Result<S
         };
 
         turns.push(Turn {
-            user: UserMessage { created_ms: user_created_ms, text: user_text },
+            user: UserMessage {
+                created_ms: user_created_ms,
+                text: user_text,
+            },
             assistant,
         });
     }
 
     if !turns.is_empty() {
-        losses.add(LossKind::TokenCounts, 1, Some("VS Code doesn't store raw token counts".to_string()));
+        losses.add(
+            LossKind::TokenCounts,
+            1,
+            Some("VS Code doesn't store raw token counts".to_string()),
+        );
     }
 
     Ok(Session {
@@ -385,9 +425,7 @@ fn parse_response(response: Option<&Vec<Value>>) -> (Vec<AssistantPart>, LossRep
 
                 losses.add(LossKind::ToolInputUnavailable, 1, None);
 
-                let output = item["pastTenseMessage"]["value"]
-                    .as_str()
-                    .map(String::from);
+                let output = item["pastTenseMessage"]["value"].as_str().map(String::from);
 
                 let call_id = item["toolCallId"]
                     .as_str()
@@ -402,8 +440,12 @@ fn parse_response(response: Option<&Vec<Value>>) -> (Vec<AssistantPart>, LossRep
                     is_error: false,
                 }));
             }
-            Some("inlineReference") | Some("terminal") | Some("confirmation")
-            | Some("mcpServersStarting") | Some("agent") | Some("progressTaskSerialized") => {}
+            Some("inlineReference")
+            | Some("terminal")
+            | Some("confirmation")
+            | Some("mcpServersStarting")
+            | Some("agent")
+            | Some("progressTaskSerialized") => {}
             Some("text") => {
                 if let Some(text) = item["value"].as_str() {
                     if !text.is_empty() {

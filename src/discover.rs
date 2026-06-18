@@ -25,7 +25,7 @@ pub fn vscode_workspace_storage_dirs() -> Vec<PathBuf> {
     // macOS
     if let Some(h) = dirs::home_dir() {
         candidates.push(
-            h.join("Library/Application Support/Code/User/workspaceStorage"),
+            h.join("Library/Application Support/Code/User/workspaceStorage")
         );
     }
 
@@ -57,7 +57,7 @@ pub fn decode_vscode_folder_uri(uri: &str) -> Option<PathBuf> {
     // WSL UNC: file://wsl.localhost/<distro>/<linux-path>
     // decoded looks like "wsl.localhost/Ubuntu/home/ali/myname"
     if path_str.starts_with("wsl.localhost/") {
-        let after_host = path_str.splitn(2, '/').nth(1)?;    // "Ubuntu/home/ali/myname"
+        let after_host = path_str.splitn(2, '/').nth(1)?; // "Ubuntu/home/ali/myname"
         let after_distro = after_host.splitn(2, '/').nth(1)?; // "home/ali/myname"
         return Some(PathBuf::from(format!("/{}", after_distro)));
     }

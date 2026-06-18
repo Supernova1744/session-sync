@@ -1,4 +1,3 @@
-use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -8,9 +7,9 @@ use uuid::Uuid;
 use crate::discover::encode_claude_path;
 use crate::error::Result;
 use crate::id::ms_to_iso;
-use crate::ir::{AssistantPart, Session, ThinkingBlock};
+use crate::ir::{AssistantPart, Session, ThinkingBlock, ToolCall};
 use crate::loss::{LossKind, LossReport};
-use crate::writers::Writer;
+use crate::writers::{atomic_write, Writer};
 
 pub struct ClaudeWriter {
     projects_dir: PathBuf,
@@ -28,9 +27,12 @@ impl Writer for ClaudeWriter {
             .map(PathBuf::from)
             .unwrap_or_else(|| self.projects_dir.clone());
 
-        let cwd = if session.cwd.is_empty() { "unknown" } else { &session.cwd };
-        let encoded = encode_claude_path(cwd);
-        let project_dir = base.join(&encoded);
+        let cwd = if session.cwd.is_empty() {
+            "unknown"
+        } else {
+            &session.cwd
+        };
+        let project_dir = base.join(encode_claude_path(cwd));
         fs::create_dir_all(&project_dir)?;
 
         let session_uuid = Uuid::new_v4().to_string();
@@ -40,52 +42,46 @@ impl Writer for ClaudeWriter {
         let mut output = String::new();
         let mut parent_uuid: Option<String> = None;
 
-        let emit = |output: &mut String, line: Value, parent: &Option<String>| {
-            let mut obj = line;
-            obj["parentUuid"] = parent.as_deref().map(Value::from).unwrap_or(Value::Null);
-            obj["isSidechain"] = json!(false);
-            obj["sessionId"] = json!(session_uuid.clone());
-            obj["version"] = json!("0.0.0");
-            output.push_str(&serde_json::to_string(&obj).unwrap_or_default());
-            output.push('\n');
-        };
-
         for turn in &session.turns {
+            let prompt_id = Uuid::new_v4().to_string();
+
+            // --- User prompt line -----------------------------------------------
             let user_uuid = Uuid::new_v4().to_string();
-            let user_ts = ms_to_iso(turn.user.created_ms);
+            push_line(
+                &mut output,
+                json!({
+                    "type": "user",
+                    "uuid": user_uuid,
+                    "promptId": &prompt_id,
+                    "timestamp": ms_to_iso(turn.user.created_ms),
+                    "userType": "external",
+                    "entrypoint": "cli",
+                    "cwd": session.cwd,
+                    "message": { "role": "user", "content": turn.user.text },
+                    "permissionMode": "auto"
+                }),
+                parent_uuid.as_deref(),
+                &session_uuid,
+            )?;
+            parent_uuid = Some(user_uuid);
 
-            let user_line = json!({
-                "type": "user",
-                "uuid": user_uuid,
-                "timestamp": user_ts,
-                "userType": "external",
-                "entrypoint": "cli",
-                "cwd": session.cwd,
-                "message": {
-                    "role": "user",
-                    "content": turn.user.text
-                },
-                "permissionMode": "auto"
-            });
-            emit(&mut output, user_line, &parent_uuid);
-            parent_uuid = Some(user_uuid.clone());
+            let Some(asst) = &turn.assistant else {
+                continue;
+            };
 
-            let Some(asst) = &turn.assistant else { continue };
-
-            // Split parts at StepBreak boundaries
-            let steps = split_at_step_breaks(&asst.parts);
-
-            for (step_idx, step_parts) in steps.iter().enumerate() {
+            // --- One assistant JSONL line per step ------------------------------
+            for (step_idx, step_parts) in split_at_step_breaks(&asst.parts).into_iter().enumerate()
+            {
                 let asst_uuid = Uuid::new_v4().to_string();
                 let asst_ts = ms_to_iso(asst.created_ms + step_idx as i64);
 
-                let mut content_blocks: Vec<Value> = vec![];
-                let mut tool_calls_this_step: Vec<(String, String, Value, Option<String>, bool)> = vec![];
+                let mut content_blocks: Vec<Value> = Vec::new();
+                let mut tool_calls: Vec<&ToolCall> = Vec::new();
 
                 for part in step_parts {
                     match part {
                         AssistantPart::Text(text) => {
-                            content_blocks.push(json!({"type": "text", "text": text}));
+                            content_blocks.push(json!({ "type": "text", "text": text }));
                         }
                         AssistantPart::Thinking(ThinkingBlock::Plaintext(text)) => {
                             content_blocks.push(json!({
@@ -104,21 +100,19 @@ impl Writer for ClaudeWriter {
                                 "name": tc.tool_name,
                                 "input": tc.input
                             }));
-                            tool_calls_this_step.push((
-                                tc.call_id.clone(),
-                                tc.tool_name.clone(),
-                                tc.input.clone(),
-                                tc.output.clone(),
-                                tc.is_error,
-                            ));
+                            tool_calls.push(tc);
                         }
-                        AssistantPart::StepBreak => unreachable!(),
+                        // `split_at_step_breaks` already split on these; a stray
+                        // one here is harmless. (Defensive; should not occur.)
+                        AssistantPart::StepBreak => {}
                     }
                 }
 
-                let has_tools = !tool_calls_this_step.is_empty();
-                let stop_reason = if has_tools { "tool_use" } else { "end_turn" };
-
+                let stop_reason = if tool_calls.is_empty() {
+                    "end_turn"
+                } else {
+                    "tool_use"
+                };
                 let usage = asst.tokens.as_ref().map(|t| {
                     json!({
                         "input_tokens": t.input,
@@ -128,65 +122,80 @@ impl Writer for ClaudeWriter {
                     })
                 });
 
-                let mut asst_line = json!({
-                    "type": "assistant",
-                    "uuid": asst_uuid,
-                    "timestamp": asst_ts,
-                    "cwd": session.cwd,
-                    "message": {
-                        "role": "assistant",
-                        "content": content_blocks,
-                        "stop_reason": stop_reason,
-                        "model": asst.model.as_deref().unwrap_or("unknown"),
-                        "type": "message",
-                        "usage": usage
-                    }
-                });
-                emit(&mut output, asst_line.take(), &parent_uuid);
-                parent_uuid = Some(asst_uuid.clone());
+                let asst_message_id = Uuid::new_v4().to_string();
 
-                // Emit tool_result user lines
-                for (call_id, _, _, output_text, is_error) in &tool_calls_this_step {
-                    let result_uuid = Uuid::new_v4().to_string();
-                    let result_ts = ms_to_iso(asst.created_ms + step_idx as i64 + 1);
-                    let result_content = output_text.as_deref().unwrap_or("");
-
-                    let result_line = json!({
-                        "type": "user",
-                        "uuid": result_uuid,
-                        "timestamp": result_ts,
-                        "userType": "external",
-                        "entrypoint": "cli",
+                push_line(
+                    &mut output,
+                    json!({
+                        "type": "assistant",
+                        "uuid": asst_uuid,
+                        "timestamp": asst_ts,
                         "cwd": session.cwd,
-                        "toolUseResult": result_content,
                         "message": {
-                            "role": "user",
-                            "content": [{
-                                "type": "tool_result",
-                                "tool_use_id": call_id,
-                                "content": result_content,
-                                "is_error": is_error
-                            }]
+                            "id": asst_message_id,
+                            "role": "assistant",
+                            "content": content_blocks,
+                            "stop_reason": stop_reason,
+                            "model": asst.model.as_deref().unwrap_or("unknown"),
+                            "type": "message",
+                            "usage": usage
                         }
-                    });
-                    emit(&mut output, result_line, &parent_uuid);
+                    }),
+                    parent_uuid.as_deref(),
+                    &session_uuid,
+                )?;
+                parent_uuid = Some(asst_uuid);
+
+                // --- One tool_result user line per tool call in this step ---------
+                for tc in tool_calls {
+                    let result_uuid = Uuid::new_v4().to_string();
+                    let result_content = tc.output.as_deref().unwrap_or("");
+                    push_line(
+                        &mut output,
+                        json!({
+                            "type": "user",
+                            "uuid": result_uuid,
+                            "promptId": &prompt_id,
+                            "timestamp": ms_to_iso(asst.created_ms + step_idx as i64 + 1),
+                            "userType": "external",
+                            "entrypoint": "cli",
+                            "cwd": session.cwd,
+                            "toolUseResult": result_content,
+                            "message": {
+                                "role": "user",
+                                "content": [{
+                                    "type": "tool_result",
+                                    "tool_use_id": tc.call_id,
+                                    "content": result_content,
+                                    "is_error": tc.is_error
+                                }]
+                            }
+                        }),
+                        parent_uuid.as_deref(),
+                        &session_uuid,
+                    )?;
                     parent_uuid = Some(result_uuid);
                 }
             }
         }
 
-        // Emit last-prompt pointer
-        if let Some(ref leaf) = parent_uuid {
-            let last_prompt = json!({
+        // last-prompt pointer references the most recently emitted line. It does
+        // NOT carry the parentUuid/isSidechain/version envelope, so emit directly.
+        if let Some(leaf) = parent_uuid {
+            let last_prompt_text = session.turns.last().map(|t| &t.user.text);
+            let mut last_prompt_obj = json!({
                 "type": "last-prompt",
                 "leafUuid": leaf,
-                "sessionId": session_uuid
+                "sessionId": &session_uuid
             });
-            output.push_str(&serde_json::to_string(&last_prompt).unwrap_or_default());
+            if let Some(text) = last_prompt_text {
+                last_prompt_obj["lastPrompt"] = json!(text);
+            }
+            output.push_str(&serde_json::to_string(&last_prompt_obj)?);
             output.push('\n');
         }
 
-        fs::write(&out_path, output.as_bytes())?;
+        atomic_write(&out_path, output.as_bytes())?;
 
         if !losses.is_empty() {
             losses.print_summary();
@@ -196,20 +205,43 @@ impl Writer for ClaudeWriter {
     }
 }
 
-fn split_at_step_breaks(parts: &[AssistantPart]) -> Vec<Vec<AssistantPart>> {
-    let mut steps: Vec<Vec<AssistantPart>> = vec![vec![]];
+/// Split a list of assistant parts into steps delimited by `StepBreak`.
+///
+/// Returns references into `parts` (no cloning). Always yields at least one
+/// (possibly empty) step; trailing empty steps are trimmed.
+fn split_at_step_breaks(parts: &[AssistantPart]) -> Vec<Vec<&AssistantPart>> {
+    let mut steps: Vec<Vec<&AssistantPart>> = vec![Vec::new()];
     for part in parts {
         match part {
-            AssistantPart::StepBreak => steps.push(vec![]),
-            other => steps.last_mut().unwrap().push(other.clone()),
+            AssistantPart::StepBreak => steps.push(Vec::new()),
+            _ => steps
+                .last_mut()
+                .expect("steps is initialized with one vec")
+                .push(part),
         }
     }
-    // Remove empty trailing steps
     while steps.last().map(|s| s.is_empty()).unwrap_or(false) {
         steps.pop();
     }
     if steps.is_empty() {
-        steps.push(vec![]);
+        steps.push(Vec::new());
     }
     steps
+}
+
+/// Serialize one JSONL line with the shared envelope fields and append it.
+fn push_line(
+    out: &mut String,
+    mut line: Value,
+    parent: Option<&str>,
+    session_uuid: &str,
+) -> Result<()> {
+    line["parentUuid"] = parent.map(Value::from).unwrap_or(Value::Null);
+    line["isSidechain"] = json!(false);
+    line["sessionId"] = json!(session_uuid);
+    line["version"] = json!("2.1.143");
+    line["gitBranch"] = json!("main");
+    out.push_str(&serde_json::to_string(&line)?);
+    out.push('\n');
+    Ok(())
 }

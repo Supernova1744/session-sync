@@ -10,7 +10,7 @@ use crate::discover::{decode_vscode_folder_uri, wsl_distro_name};
 use crate::error::{anyhow, Result};
 use crate::ir::{AssistantPart, Session, ThinkingBlock};
 use crate::loss::{LossKind, LossReport};
-use crate::writers::Writer;
+use crate::writers::{atomic_write, Writer};
 
 pub struct VsCodeWriter {
     workspace_storage_dirs: Vec<PathBuf>,
@@ -18,21 +18,29 @@ pub struct VsCodeWriter {
 
 impl VsCodeWriter {
     pub fn new(workspace_storage_dirs: Vec<PathBuf>) -> Self {
-        Self { workspace_storage_dirs }
+        Self {
+            workspace_storage_dirs,
+        }
     }
 
     /// Find the workspace hash dir whose workspace.json folder matches `cwd`.
     fn find_hash_dir_for_cwd(&self, cwd: &str) -> Option<PathBuf> {
         for ws_dir in &self.workspace_storage_dirs {
-            let Ok(entries) = fs::read_dir(ws_dir) else { continue };
+            let Ok(entries) = fs::read_dir(ws_dir) else {
+                continue;
+            };
             for entry in entries.flatten() {
                 let hash_dir = entry.path();
                 let workspace_json = hash_dir.join("workspace.json");
                 if !workspace_json.exists() {
                     continue;
                 }
-                let Ok(content) = fs::read_to_string(&workspace_json) else { continue };
-                let Ok(v) = serde_json::from_str::<Value>(&content) else { continue };
+                let Ok(content) = fs::read_to_string(&workspace_json) else {
+                    continue;
+                };
+                let Ok(v) = serde_json::from_str::<Value>(&content) else {
+                    continue;
+                };
                 if let Some(folder_uri) = v["folder"].as_str() {
                     if let Some(folder_path) = decode_vscode_folder_uri(folder_uri) {
                         if folder_path.to_string_lossy() == cwd {
@@ -57,7 +65,11 @@ impl VsCodeWriter {
 
         if let Some(distro) = wsl_distro_name() {
             let without_slash = path.trim_start_matches('/');
-            return format!("file://wsl.localhost/{}/{}", distro, encode_segments(without_slash));
+            return format!(
+                "file://wsl.localhost/{}/{}",
+                distro,
+                encode_segments(without_slash)
+            );
         }
 
         format!("file://{}", encode_segments(path))
@@ -69,7 +81,10 @@ impl VsCodeWriter {
         fs::create_dir_all(&hash_dir)?;
         if !cwd.is_empty() {
             let workspace_json = json!({ "folder": Self::path_to_file_uri(cwd) });
-            fs::write(hash_dir.join("workspace.json"), serde_json::to_string_pretty(&workspace_json)?)?;
+            atomic_write(
+                &hash_dir.join("workspace.json"),
+                serde_json::to_string_pretty(&workspace_json)?.as_bytes(),
+            )?;
         }
         Ok(hash_dir)
     }
@@ -92,7 +107,9 @@ impl VsCodeWriter {
             }
         }
 
-        Err(anyhow!("No VS Code workspaceStorage directory found. Is VS Code installed?"))
+        Err(anyhow!(
+            "No VS Code workspaceStorage directory found. Is VS Code installed?"
+        ))
     }
 }
 
@@ -171,12 +188,28 @@ impl Writer for VsCodeWriter {
             }
 
             let completed_at = if let Some(asst) = &turn.assistant {
-                if asst.created_ms > 0 { asst.created_ms } else { turn.user.created_ms }
+                if asst.created_ms > 0 {
+                    asst.created_ms
+                } else {
+                    turn.user.created_ms
+                }
             } else {
                 turn.user.created_ms
             };
 
-            let text_len = turn.user.text.chars().count();
+            // VS Code / Monaco positions are UTF-16 code-unit based and 1-based
+            // line numbers, so measure in UTF-16 (not chars) and end on the line
+            // that actually contains the last character (not always line 1).
+            let utf16_len = turn.user.text.encode_utf16().count();
+            let line_count = turn.user.text.lines().count().max(1);
+            let last_line_utf16 = turn
+                .user
+                .text
+                .rsplit('\n')
+                .next()
+                .unwrap_or("")
+                .encode_utf16()
+                .count();
             requests.push(json!({
                 "requestId": format!("request_{}", request_uuid),
                 "timestamp": turn.user.created_ms,
@@ -198,7 +231,7 @@ impl Writer for VsCodeWriter {
                 "modelState": {"value": 1, "completedAt": completed_at},
                 "contentReferences": [],
                 "codeCitations": [],
-                "timeSpentWaiting": turn.user.created_ms,
+                "timeSpentWaiting": 0,
                 "completionTokens": 0,
                 "elapsedMs": 0,
                 "modeInfo": {
@@ -212,10 +245,11 @@ impl Writer for VsCodeWriter {
                 "message": {
                     "text": turn.user.text,
                     "parts": [{
-                        "range": {"start": 0, "endExclusive": text_len},
+                        "range": {"start": 0, "endExclusive": utf16_len},
                         "editorRange": {
                             "startLineNumber": 1, "startColumn": 1,
-                            "endLineNumber": 1, "endColumn": (text_len + 1) as i64
+                            "endLineNumber": line_count as i64,
+                            "endColumn": (last_line_utf16 + 1) as i64
                         },
                         "text": turn.user.text,
                         "kind": "text"
@@ -269,12 +303,24 @@ impl Writer for VsCodeWriter {
         }))?;
 
         let session_file = chat_sessions_dir.join(format!("{}.jsonl", new_uuid));
-        fs::write(&session_file, session_line)
+        atomic_write(&session_file, session_line.as_bytes())
             .with_context(|| format!("writing session file: {}", session_file.display()))?;
 
-        // Update state.vscdb index
+        // Update state.vscdb index. If this fails (e.g. the DB is corrupt or
+        // SQLite stays locked past the busy timeout), remove the orphan session
+        // file so we never leave a file that no index references.
         let db_path = hash_dir.join("state.vscdb");
-        update_vscdb_index(&db_path, &new_uuid, session)?;
+        if let Err(e) = update_vscdb_index(&db_path, &new_uuid, session) {
+            // On Windows the session file may still be locked by VS Code, so
+            // don't claim it was removed unless remove_file actually succeeded.
+            let removed = fs::remove_file(&session_file).is_ok();
+            let msg = if removed {
+                "updating state.vscdb index failed; orphan session file removed"
+            } else {
+                "updating state.vscdb index failed; orphan session file could not be removed"
+            };
+            return Err(e).context(msg);
+        }
 
         losses.print_summary();
         Ok(session_file.to_string_lossy().into_owned())
@@ -282,24 +328,43 @@ impl Writer for VsCodeWriter {
 }
 
 fn update_vscdb_index(db_path: &Path, session_uuid: &str, session: &Session) -> Result<()> {
-    let conn = Connection::open(db_path)?;
+    let mut conn = Connection::open(db_path)
+        .with_context(|| format!("opening state.vscdb: {}", db_path.display()))?;
+    // busy_timeout: VS Code itself usually has this DB open. Without a timeout
+    // we'd get an immediate SQLITE_BUSY and — worse — used to fall through to
+    // overwriting the index with an empty one (silent history wipe).
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);",
+        "PRAGMA busy_timeout = 5000;
+         CREATE TABLE IF NOT EXISTS ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);",
     )?;
 
-    let existing: Option<String> = conn
-        .query_row(
-            "SELECT value FROM ItemTable WHERE key = 'chat.ChatSessionStore.index'",
-            [],
-            |row| row.get(0),
-        )
-        .ok();
+    // Read-modify-write must be a single transaction so VS Code cannot sneak a
+    // concurrent write between our read and our write (TOCTOU).
+    let tx = conn.transaction()?;
 
-    let mut index: Value = if let Some(s) = existing {
-        serde_json::from_str(&s).unwrap_or(json!({"version": 1, "entries": {}}))
-    } else {
-        json!({"version": 1, "entries": {}})
+    // Distinguish "no such row" from a real DB error. A real error must propagate;
+    // only a missing row legitimately means "no index yet".
+    let existing = match tx.query_row::<String, _, _>(
+        "SELECT value FROM ItemTable WHERE key = 'chat.ChatSessionStore.index'",
+        [],
+        |row| row.get(0),
+    ) {
+        Ok(s) => Some(s),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(e) => return Err(e).context("reading chat session index from state.vscdb"),
     };
+
+    // Never fall back to an empty index on corrupt JSON — that would overwrite
+    // the user's entire chat history. Propagate instead.
+    let mut index: Value = match existing {
+        Some(s) => serde_json::from_str(&s)
+            .context("state.vscdb chat index is corrupt — refusing to overwrite")?,
+        None => json!({"version": 1, "entries": {}}),
+    };
+
+    let entries = index["entries"]
+        .as_object_mut()
+        .context("unexpected chat index shape in state.vscdb (entries is not an object)")?;
 
     let entry = json!({
         "sessionId": session_uuid,
@@ -318,13 +383,14 @@ fn update_vscdb_index(db_path: &Path, session_uuid: &str, session: &Session) -> 
         }
     });
 
-    index["entries"][session_uuid] = entry;
+    entries.insert(session_uuid.to_string(), entry);
 
     let updated = serde_json::to_string(&index)?;
-    conn.execute(
+    tx.execute(
         "INSERT OR REPLACE INTO ItemTable (key, value) VALUES ('chat.ChatSessionStore.index', ?1)",
         rusqlite::params![updated],
     )?;
 
+    tx.commit()?;
     Ok(())
 }

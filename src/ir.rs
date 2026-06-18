@@ -4,35 +4,35 @@ use crate::loss::LossReport;
 
 #[derive(Debug, Clone, Default)]
 pub struct Session {
-    pub source_id:  String,
-    pub title:      String,
-    pub cwd:        String,
+    pub source_id: String,
+    pub title: String,
+    pub cwd: String,
     pub created_ms: i64,
     pub updated_ms: i64,
-    pub turns:      Vec<Turn>,
-    pub losses:     LossReport,
+    pub turns: Vec<Turn>,
+    pub losses: LossReport,
 }
 
 #[derive(Debug, Clone)]
 pub struct Turn {
-    pub user:      UserMessage,
+    pub user: UserMessage,
     pub assistant: Option<AssistantMessage>,
 }
 
 #[derive(Debug, Clone)]
 pub struct UserMessage {
     pub created_ms: i64,
-    pub text:       String,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct AssistantMessage {
     pub created_ms: i64,
-    pub model:      Option<String>,
-    pub provider:   Option<String>,
-    pub tokens:     Option<TokenUsage>,
-    pub cost_usd:   Option<f64>,
-    pub parts:      Vec<AssistantPart>,
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    pub tokens: Option<TokenUsage>,
+    pub cost_usd: Option<f64>,
+    pub parts: Vec<AssistantPart>,
 }
 
 #[derive(Debug, Clone)]
@@ -48,27 +48,30 @@ pub enum AssistantPart {
 
 #[derive(Debug, Clone)]
 pub struct ToolCall {
-    pub call_id:   String,
+    pub call_id: String,
     pub tool_name: String,
     /// Structured input; Value::Null when not available (VS Code)
-    pub input:     Value,
-    pub output:    Option<String>,
-    pub is_error:  bool,
+    pub input: Value,
+    pub output: Option<String>,
+    pub is_error: bool,
 }
 
 #[derive(Debug, Clone)]
 pub enum ThinkingBlock {
     Plaintext(String),
     /// VS Code encrypted base64 — preserved opaque for round-trip
-    Opaque { id: String, value: String },
+    Opaque {
+        id: String,
+        value: String,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct TokenUsage {
-    pub input:       i64,
-    pub output:      i64,
-    pub reasoning:   i64,
-    pub cache_read:  i64,
+    pub input: i64,
+    pub output: i64,
+    pub reasoning: i64,
+    pub cache_read: i64,
     pub cache_write: i64,
 }
 

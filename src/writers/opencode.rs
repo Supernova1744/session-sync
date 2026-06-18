@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use rusqlite::{params, Connection};
-use serde_json::json;
+use rusqlite::{params, Connection, Transaction};
+use serde_json::{json, Value};
 
 use crate::error::Result;
 use crate::id::{new_message_id, new_part_id, new_session_id, new_slug, now_ms};
@@ -19,58 +19,62 @@ impl OpenCodeWriter {
         Self { db_path }
     }
 
-    fn open(&self) -> Result<Connection> {
-        let conn = Connection::open(&self.db_path)
-            .with_context(|| format!("opening OpenCode DB: {}", self.db_path.display()))?;
-        conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")?;
+    fn open_at(db_path: &Path) -> Result<Connection> {
+        let conn = Connection::open(db_path)
+            .with_context(|| format!("opening OpenCode DB: {}", db_path.display()))?;
+        // busy_timeout: if OpenCode itself is running and holds the DB, wait up
+        // to 5s for the lock instead of failing immediately with SQLITE_BUSY.
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             PRAGMA journal_mode = WAL;
+             PRAGMA busy_timeout = 5000;",
+        )?;
         Ok(conn)
     }
 }
 
 impl Writer for OpenCodeWriter {
-    fn write_session(&self, session: &Session, _out_dir: Option<&Path>) -> Result<String> {
-        let mut conn = self.open()?;
+    fn write_session(&self, session: &Session, out_dir: Option<&Path>) -> Result<String> {
+        // Resolve the target DB path. `out_dir` may be either a directory that
+        // should contain `opencode.db` (mirrors the reader's `--dir` handling in
+        // main.rs) or the DB file path itself. When omitted, write to the user's
+        // native OpenCode DB.
+        let db_path = match out_dir {
+            Some(p) if p.file_name().and_then(|n| n.to_str()) == Some("opencode.db") => {
+                p.to_path_buf()
+            }
+            Some(dir) => dir.join("opencode.db"),
+            None => self.db_path.clone(),
+        };
+        if let Some(parent) = db_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let mut conn = Self::open_at(&db_path)?;
         let mut losses = LossReport::default();
 
         // Normalize empty cwd to "/" so session.directory matches the global project's worktree
-        let directory = if session.cwd.is_empty() { "/" } else { session.cwd.as_str() };
+        let directory = if session.cwd.is_empty() {
+            "/"
+        } else {
+            session.cwd.as_str()
+        };
 
-        // Aggregate totals for session row
-        let total_tokens_input: i64 = session
-            .turns
-            .iter()
-            .flat_map(|t| t.assistant.as_ref())
-            .filter_map(|a| a.tokens.as_ref())
-            .map(|t| t.input)
-            .sum();
-        let total_tokens_output: i64 = session
-            .turns
-            .iter()
-            .flat_map(|t| t.assistant.as_ref())
-            .filter_map(|a| a.tokens.as_ref())
-            .map(|t| t.output)
-            .sum();
-        let total_tokens_reasoning: i64 = session
-            .turns
-            .iter()
-            .flat_map(|t| t.assistant.as_ref())
-            .filter_map(|a| a.tokens.as_ref())
-            .map(|t| t.reasoning)
-            .sum();
-        let total_cache_read: i64 = session
-            .turns
-            .iter()
-            .flat_map(|t| t.assistant.as_ref())
-            .filter_map(|a| a.tokens.as_ref())
-            .map(|t| t.cache_read)
-            .sum();
-        let total_cache_write: i64 = session
-            .turns
-            .iter()
-            .flat_map(|t| t.assistant.as_ref())
-            .filter_map(|a| a.tokens.as_ref())
-            .map(|t| t.cache_write)
-            .sum();
+        // Aggregate token usage across every assistant message in one pass.
+        let (tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write) =
+            session
+                .turns
+                .iter()
+                .filter_map(|t| t.assistant.as_ref())
+                .filter_map(|a| a.tokens.as_ref())
+                .fold((0i64, 0, 0, 0, 0), |(i, o, r, cr, cw), t| {
+                    (
+                        i + t.input,
+                        o + t.output,
+                        r + t.reasoning,
+                        cr + t.cache_read,
+                        cw + t.cache_write,
+                    )
+                });
         let total_cost: f64 = session.total_cost();
 
         let ses_id = new_session_id(session.created_ms);
@@ -95,11 +99,11 @@ impl Writer for OpenCodeWriter {
                 path,
                 session.title,
                 total_cost,
-                total_tokens_input,
-                total_tokens_output,
-                total_tokens_reasoning,
-                total_cache_read,
-                total_cache_write,
+                tokens_input,
+                tokens_output,
+                tokens_reasoning,
+                tokens_cache_read,
+                tokens_cache_write,
                 session.created_ms,
                 session.updated_ms,
             ],
@@ -114,27 +118,24 @@ impl Writer for OpenCodeWriter {
                 "model": { "providerID": "unknown", "modelID": "unknown" },
                 "summary": { "diffs": [] }
             });
-            tx.execute(
-                "INSERT INTO message (id, session_id, time_created, time_updated, data)
-                 VALUES (?1,?2,?3,?3,?4)",
-                params![user_msg_id, ses_id, turn.user.created_ms, user_data.to_string()],
+            insert_message(&tx, &user_msg_id, &ses_id, turn.user.created_ms, user_data)?;
+
+            // User text part. (time_created is the user message's timestamp; the
+            // legacy `t += 1` here was dead — `t` is reset below before reuse.)
+            let user_part_data = json!({ "type": "text", "text": turn.user.text });
+            insert_part(
+                &tx,
+                &user_msg_id,
+                &ses_id,
+                turn.user.created_ms,
+                user_part_data,
             )?;
 
-            // User text part
-            let mut t = turn.user.created_ms;
-            let user_part_id = new_part_id(t);
-            t += 1;
-            let user_part_data = json!({"type": "text", "text": turn.user.text});
-            tx.execute(
-                "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
-                 VALUES (?1,?2,?3,?4,?4,?5)",
-                params![user_part_id, user_msg_id, ses_id, turn.user.created_ms, user_part_data.to_string()],
-            )?;
-
-            let Some(asst) = &turn.assistant else { continue };
+            let Some(asst) = &turn.assistant else {
+                continue;
+            };
 
             let asst_msg_id = new_message_id(asst.created_ms);
-            let finish_reason = "end-turn";
             let asst_data = json!({
                 "parentID": user_msg_id,
                 "role": "assistant",
@@ -152,92 +153,96 @@ impl Writer for OpenCodeWriter {
                 "modelID": asst.model.as_deref().unwrap_or("unknown"),
                 "providerID": asst.provider.as_deref().unwrap_or("unknown"),
                 "time": { "created": asst.created_ms, "completed": asst.created_ms },
-                "finish": finish_reason
+                "finish": "end-turn"
             });
-            tx.execute(
-                "INSERT INTO message (id, session_id, time_created, time_updated, data)
-                 VALUES (?1,?2,?3,?3,?4)",
-                params![asst_msg_id, ses_id, asst.created_ms, asst_data.to_string()],
+            insert_message(&tx, &asst_msg_id, &ses_id, asst.created_ms, asst_data)?;
+
+            // `t` is a monotonic tick giving each part a distinct id and
+            // time_created within this assistant message. Each insert consumes
+            // the current tick, then we advance.
+            let mut t = asst.created_ms;
+
+            // Open the first step.
+            insert_part(
+                &tx,
+                &asst_msg_id,
+                &ses_id,
+                t,
+                json!({ "type": "step-start" }),
             )?;
-
-            // Write parts
-            t = asst.created_ms;
-
-            // Open first step
-            let step_start_id = new_part_id(t);
             t += 1;
-            tx.execute(
-                "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
-                 VALUES (?1,?2,?3,?4,?4,?5)",
-                params![step_start_id, asst_msg_id, ses_id, t - 1, json!({"type":"step-start"}).to_string()],
-            )?;
 
             let mut last_had_tools = false;
 
             for part in &asst.parts {
                 match part {
                     AssistantPart::StepBreak => {
-                        let finish_id = new_part_id(t);
-                        t += 1;
-                        let finish_data = json!({
-                            "type": "step-finish",
-                            "reason": if last_had_tools { "tool-calls" } else { "end-turn" }
-                        });
-                        tx.execute(
-                            "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
-                             VALUES (?1,?2,?3,?4,?4,?5)",
-                            params![finish_id, asst_msg_id, ses_id, t - 1, finish_data.to_string()],
+                        let reason = if last_had_tools {
+                            "tool-calls"
+                        } else {
+                            "end-turn"
+                        };
+                        insert_part(
+                            &tx,
+                            &asst_msg_id,
+                            &ses_id,
+                            t,
+                            json!({ "type": "step-finish", "reason": reason }),
                         )?;
-                        let start_id = new_part_id(t);
                         t += 1;
-                        tx.execute(
-                            "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
-                             VALUES (?1,?2,?3,?4,?4,?5)",
-                            params![start_id, asst_msg_id, ses_id, t - 1, json!({"type":"step-start"}).to_string()],
+                        insert_part(
+                            &tx,
+                            &asst_msg_id,
+                            &ses_id,
+                            t,
+                            json!({ "type": "step-start" }),
                         )?;
+                        t += 1;
                         last_had_tools = false;
                     }
                     AssistantPart::Text(text) => {
-                        let pid = new_part_id(t);
-                        t += 1;
-                        let data = json!({"type": "text", "text": text, "time": {"start": t-1, "end": t}});
-                        tx.execute(
-                            "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
-                             VALUES (?1,?2,?3,?4,?4,?5)",
-                            params![pid, asst_msg_id, ses_id, t - 1, data.to_string()],
+                        insert_part(
+                            &tx,
+                            &asst_msg_id,
+                            &ses_id,
+                            t,
+                            json!({ "type": "text", "text": text, "time": { "start": t, "end": t + 1 } }),
                         )?;
+                        t += 1;
                     }
                     AssistantPart::Thinking(ThinkingBlock::Plaintext(text)) => {
-                        let pid = new_part_id(t);
-                        t += 1;
-                        let data = json!({"type": "reasoning", "text": text, "time": {"start": t-1, "end": t}});
-                        tx.execute(
-                            "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
-                             VALUES (?1,?2,?3,?4,?4,?5)",
-                            params![pid, asst_msg_id, ses_id, t - 1, data.to_string()],
+                        insert_part(
+                            &tx,
+                            &asst_msg_id,
+                            &ses_id,
+                            t,
+                            json!({
+                                "type": "reasoning",
+                                "text": text,
+                                "time": { "start": t, "end": t + 1 }
+                            }),
                         )?;
+                        t += 1;
                     }
                     AssistantPart::Thinking(ThinkingBlock::Opaque { .. }) => {
                         losses.add(LossKind::EncryptedThinking, 1, None);
                     }
                     AssistantPart::ToolCall(tc) => {
                         last_had_tools = true;
-                        let pid = new_part_id(t);
-                        t += 1;
                         let status = if tc.is_error { "error" } else { "completed" };
                         let state = if tc.is_error {
                             json!({
                                 "status": status,
                                 "input": tc.input,
                                 "error": tc.output.as_deref().unwrap_or(""),
-                                "time": {"start": t-1, "end": t}
+                                "time": { "start": t, "end": t + 1 }
                             })
                         } else {
                             json!({
                                 "status": status,
                                 "input": tc.input,
                                 "output": tc.output.as_deref().unwrap_or(""),
-                                "time": {"start": t-1, "end": t}
+                                "time": { "start": t, "end": t + 1 }
                             })
                         };
                         let data = json!({
@@ -246,26 +251,24 @@ impl Writer for OpenCodeWriter {
                             "callID": tc.call_id,
                             "state": state
                         });
-                        tx.execute(
-                            "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
-                             VALUES (?1,?2,?3,?4,?4,?5)",
-                            params![pid, asst_msg_id, ses_id, t - 1, data.to_string()],
-                        )?;
+                        insert_part(&tx, &asst_msg_id, &ses_id, t, data)?;
+                        t += 1;
                     }
                 }
             }
 
-            // Close final step
-            let finish_id = new_part_id(t);
-            t += 1;
-            let finish_data = json!({
-                "type": "step-finish",
-                "reason": if last_had_tools { "tool-calls" } else { "end-turn" }
-            });
-            tx.execute(
-                "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
-                 VALUES (?1,?2,?3,?4,?4,?5)",
-                params![finish_id, asst_msg_id, ses_id, t - 1, finish_data.to_string()],
+            // Close the final step.
+            let reason = if last_had_tools {
+                "tool-calls"
+            } else {
+                "end-turn"
+            };
+            insert_part(
+                &tx,
+                &asst_msg_id,
+                &ses_id,
+                t,
+                json!({ "type": "step-finish", "reason": reason }),
             )?;
         }
 
@@ -273,6 +276,33 @@ impl Writer for OpenCodeWriter {
         losses.print_summary();
         Ok(ses_id)
     }
+}
+
+/// Insert one row into the `message` table. `time_updated` mirrors `time_created`.
+fn insert_message(
+    tx: &Transaction,
+    msg_id: &str,
+    ses_id: &str,
+    created_ms: i64,
+    data: Value,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO message (id, session_id, time_created, time_updated, data)
+         VALUES (?1,?2,?3,?3,?4)",
+        params![msg_id, ses_id, created_ms, data.to_string()],
+    )?;
+    Ok(())
+}
+
+/// Insert one row into the `part` table. `seq` is used for both the part id and
+/// `time_created`; `time_updated` mirrors it. Caller advances `seq` between calls.
+fn insert_part(tx: &Transaction, msg_id: &str, ses_id: &str, seq: i64, data: Value) -> Result<()> {
+    tx.execute(
+        "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
+         VALUES (?1,?2,?3,?4,?4,?5)",
+        params![new_part_id(seq), msg_id, ses_id, seq, data.to_string()],
+    )?;
+    Ok(())
 }
 
 fn ensure_global_project(conn: &Connection) -> Result<()> {

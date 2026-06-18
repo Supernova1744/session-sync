@@ -7,6 +7,9 @@ mod loss;
 mod readers;
 mod writers;
 
+#[cfg(test)]
+mod e2e_tests;
+
 use std::path::PathBuf;
 
 use anyhow::Context;
@@ -16,14 +19,14 @@ use cli::{Cli, Command, Tool};
 use discover::{claude_projects_dir, opencode_db_path, vscode_workspace_storage_dirs};
 use error::{anyhow, Result};
 use id::ms_to_iso;
-use readers::{Reader, SessionSummary};
 use readers::claude::ClaudeReader;
 use readers::opencode::OpenCodeReader;
 use readers::vscode::VsCodeReader;
-use writers::Writer;
+use readers::{Reader, SessionSummary};
 use writers::claude::ClaudeWriter;
 use writers::opencode::OpenCodeWriter;
 use writers::vscode::VsCodeWriter;
+use writers::Writer;
 
 fn main() {
     if let Err(e) = run() {
@@ -36,9 +39,12 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::List { from, dir, all } => cmd_list(&from, dir, all),
-        Command::Convert { from, to, session, out_dir } => {
-            cmd_convert(&from, &to, session, out_dir)
-        }
+        Command::Convert {
+            from,
+            to,
+            session,
+            out_dir,
+        } => cmd_convert(&from, &to, session, out_dir),
     }
 }
 
@@ -71,7 +77,12 @@ fn cmd_list(tool: &Tool, dir: Option<PathBuf>, all: bool) -> Result<()> {
     }
 
     let header = if let Some(ref cwd) = cwd_filter {
-        format!("Sessions in {} for {} ({} total):", tool, cwd, sessions.len())
+        format!(
+            "Sessions in {} for {} ({} total):",
+            tool,
+            cwd,
+            sessions.len()
+        )
     } else {
         format!("Sessions in {} ({} total):", tool, sessions.len())
     };
@@ -83,7 +94,11 @@ fn cmd_list(tool: &Tool, dir: Option<PathBuf>, all: bool) -> Result<()> {
         } else {
             "unknown time".to_string()
         };
-        let cwd = if s.cwd.is_empty() { "(no path)" } else { &s.cwd };
+        let cwd = if s.cwd.is_empty() {
+            "(no path)"
+        } else {
+            &s.cwd
+        };
         println!("  ID:    {}", s.id);
         println!("  Title: {}", s.title);
         println!("  Dir:   {}", cwd);
@@ -176,13 +191,12 @@ fn make_reader(tool: &Tool, dir: Option<&std::path::Path>) -> Result<Box<dyn Rea
 fn make_writer(tool: &Tool) -> Result<Box<dyn Writer>> {
     match tool {
         Tool::Claude => {
-            let projects_dir = claude_projects_dir()
-                .context("Cannot locate Claude projects directory")?;
+            let projects_dir =
+                claude_projects_dir().context("Cannot locate Claude projects directory")?;
             Ok(Box::new(ClaudeWriter::new(projects_dir)))
         }
         Tool::Opencode => {
-            let db_path = opencode_db_path()
-                .context("Cannot locate OpenCode database")?;
+            let db_path = opencode_db_path().context("Cannot locate OpenCode database")?;
             Ok(Box::new(OpenCodeWriter::new(db_path)))
         }
         Tool::Vscode => {

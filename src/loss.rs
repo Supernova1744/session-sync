@@ -9,6 +9,7 @@ pub enum LossKind {
     OpenCodeTodos,
     CanceledRequest,
     UnsupportedPartType,
+    MissingToolResult,
 }
 
 impl LossKind {
@@ -23,6 +24,7 @@ impl LossKind {
             LossKind::OpenCodeTodos => "OpenCode todo items",
             LossKind::CanceledRequest => "Canceled requests",
             LossKind::UnsupportedPartType => "Unsupported content part types",
+            LossKind::MissingToolResult => "Tool calls with no matching result",
         }
     }
 }

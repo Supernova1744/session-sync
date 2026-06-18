@@ -6,7 +6,10 @@ use anyhow::Context;
 use serde_json::Value;
 
 use crate::error::{anyhow, Result};
-use crate::ir::{AssistantMessage, AssistantPart, Session, ThinkingBlock, TokenUsage, ToolCall, Turn, UserMessage};
+use crate::ir::{
+    AssistantMessage, AssistantPart, Session, ThinkingBlock, TokenUsage, ToolCall, Turn,
+    UserMessage,
+};
 use crate::loss::{LossKind, LossReport};
 use crate::readers::{Reader, SessionSummary};
 
@@ -68,6 +71,7 @@ impl Reader for ClaudeReader {
     }
 
     fn read_session(&self, id: &str) -> Result<Session> {
+        crate::readers::validate_session_id(id)?;
         let path = self
             .find_jsonl(id)
             .ok_or_else(|| anyhow!("Claude session not found: {}", id))?;
@@ -82,7 +86,9 @@ fn scan_jsonl_for_summary(path: &Path, id: &str) -> SessionSummary {
     let mut cwd = String::new();
 
     for line in content.lines().take(50) {
-        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
         let t = v["type"].as_str().unwrap_or("");
         if t == "ai-title" {
             if let Some(s) = v["aiTitle"].as_str() {
@@ -109,7 +115,9 @@ fn scan_jsonl_for_summary(path: &Path, id: &str) -> SessionSummary {
     // Fallback title from first user message
     if title == "(untitled)" {
         for line in content.lines() {
-            let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+            let Ok(v) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
             if v["type"].as_str() == Some("user") {
                 let msg_content = &v["message"]["content"];
                 let text = if let Some(s) = msg_content.as_str() {
@@ -123,8 +131,9 @@ fn scan_jsonl_for_summary(path: &Path, id: &str) -> SessionSummary {
                     String::new()
                 };
                 if !text.is_empty() {
+                    let char_count = text.chars().count();
                     let truncated: String = text.chars().take(60).collect();
-                    title = if text.len() > 60 {
+                    title = if char_count > 60 {
                         format!("{}…", truncated)
                     } else {
                         truncated
@@ -135,7 +144,68 @@ fn scan_jsonl_for_summary(path: &Path, id: &str) -> SessionSummary {
         }
     }
 
-    SessionSummary { id: id.to_string(), title, updated_ms, cwd }
+    SessionSummary {
+        id: id.to_string(),
+        title,
+        updated_ms,
+        cwd,
+    }
+}
+
+/// Accumulator for the turn currently being parsed out of a Claude JSONL stream.
+///
+/// Holds the pending user message, the assistant parts/metadata built up across
+/// one or more consecutive assistant lines, the `call_id → asst_parts index` map
+/// used to stitch `tool_result`s back onto their `tool_use`, and the step count
+/// that decides where `StepBreak`s go. `flush` packages everything into a `Turn`.
+#[derive(Default)]
+struct TurnBuilder {
+    current_user: Option<UserMessage>,
+    asst_parts: Vec<AssistantPart>,
+    asst_meta: Option<AssistantMessage>,
+    pending_calls: HashMap<String, usize>,
+    asst_step_count: usize,
+}
+
+impl TurnBuilder {
+    fn flush(&mut self, turns: &mut Vec<Turn>, losses: &mut LossReport) {
+        // Report tool_uses that never received a tool_result before this turn
+        // ends. Tool results that arrived were stitched into the ToolCall and
+        // set its `output`; un-stitched ones still have `output: None`.
+        // Gate on current_user: when it's None (assistant content before the
+        // first user prompt) those parts are reported separately by the caller,
+        // so counting them here would double-report the same dropped data.
+        if self.current_user.is_some() {
+            let orphan_count = self
+                .pending_calls
+                .values()
+                .filter_map(|&idx| match self.asst_parts.get(idx) {
+                    Some(AssistantPart::ToolCall(tc)) if tc.output.is_none() => Some(()),
+                    _ => None,
+                })
+                .count();
+            if orphan_count > 0 {
+                losses.add(
+                    LossKind::MissingToolResult,
+                    orphan_count,
+                    Some("tool_use with no matching tool_result".to_string()),
+                );
+            }
+        }
+
+        if let Some(user) = self.current_user.take() {
+            let assistant = self.asst_meta.take().map(|mut a| {
+                a.parts = std::mem::take(&mut self.asst_parts);
+                a
+            });
+            if assistant.is_none() {
+                self.asst_parts.clear();
+            }
+            turns.push(Turn { user, assistant });
+        }
+        self.pending_calls.clear();
+        self.asst_step_count = 0;
+    }
 }
 
 fn parse_jsonl(path: &Path, session_id: &str) -> Result<Session> {
@@ -143,41 +213,14 @@ fn parse_jsonl(path: &Path, session_id: &str) -> Result<Session> {
     let mut losses = LossReport::default();
 
     let mut turns: Vec<Turn> = vec![];
-    // Current pending user message
-    let mut current_user: Option<UserMessage> = None;
-    // Parts accumulating for the current assistant response
-    let mut asst_parts: Vec<AssistantPart> = vec![];
-    // Metadata for the current assistant
-    let mut asst_meta: Option<AssistantMessage> = None;
-    // call_id → index in asst_parts (for stitching tool results)
-    let mut pending_calls: HashMap<String, usize> = HashMap::new();
-    // How many assistant lines we've seen in the current turn (for StepBreak)
-    let mut asst_step_count = 0usize;
+    // Turn-in-progress state, encapsulated so the per-turn flush logic stays
+    // cohesive instead of being threaded through six mutable parameters.
+    let mut builder = TurnBuilder::default();
 
     let mut session_cwd = String::new();
     let mut session_created_ms = i64::MAX;
     let mut session_updated_ms = 0i64;
     let mut session_title = String::from("(untitled)");
-
-    let flush_turn = |turns: &mut Vec<Turn>,
-                      current_user: &mut Option<UserMessage>,
-                      asst_parts: &mut Vec<AssistantPart>,
-                      asst_meta: &mut Option<AssistantMessage>,
-                      pending_calls: &mut HashMap<String, usize>,
-                      asst_step_count: &mut usize| {
-        if let Some(user) = current_user.take() {
-            let assistant = asst_meta.take().map(|mut a| {
-                a.parts = asst_parts.drain(..).collect();
-                a
-            });
-            if assistant.is_none() {
-                asst_parts.clear();
-            }
-            turns.push(Turn { user, assistant });
-        }
-        pending_calls.clear();
-        *asst_step_count = 0;
-    };
 
     for line in content.lines() {
         let line = line.trim();
@@ -228,46 +271,53 @@ fn parse_jsonl(path: &Path, session_id: &str) -> Result<Session> {
                 if !tool_results.is_empty() {
                     // Stitch results into pending ToolCall parts
                     for (call_id, output, is_error) in tool_results {
-                        if let Some(&idx) = pending_calls.get(&call_id) {
-                            if let Some(AssistantPart::ToolCall(tc)) = asst_parts.get_mut(idx) {
+                        if let Some(&idx) = builder.pending_calls.get(&call_id) {
+                            if let Some(AssistantPart::ToolCall(tc)) =
+                                builder.asst_parts.get_mut(idx)
+                            {
                                 tc.output = Some(output);
                                 tc.is_error = is_error;
                             }
                         } else {
-                            losses.add(LossKind::UnsupportedPartType, 1,
-                                Some("tool result with no matching tool_use in current turn".to_string()));
+                            losses.add(
+                                LossKind::UnsupportedPartType,
+                                1,
+                                Some(
+                                    "tool result with no matching tool_use in current turn"
+                                        .to_string(),
+                                ),
+                            );
                         }
                     }
                     continue;
                 }
 
                 // New user prompt — flush previous turn
-                flush_turn(
-                    &mut turns,
-                    &mut current_user,
-                    &mut asst_parts,
-                    &mut asst_meta,
-                    &mut pending_calls,
-                    &mut asst_step_count,
-                );
+                builder.flush(&mut turns, &mut losses);
 
-                // Any asst_parts still present after flush means they preceded the first user message
-                if !asst_parts.is_empty() {
-                    losses.add(LossKind::UnsupportedPartType, asst_parts.len(),
-                        Some("assistant content before first user message".to_string()));
+                // Any parts still present after flush preceded the first user message.
+                if !builder.asst_parts.is_empty() {
+                    losses.add(
+                        LossKind::UnsupportedPartType,
+                        builder.asst_parts.len(),
+                        Some("assistant content before first user message".to_string()),
+                    );
                 }
                 let text = extract_user_text(content);
                 let ts_ms = parse_timestamp_ms(v["timestamp"].as_str());
-                current_user = Some(UserMessage { created_ms: ts_ms, text });
-                asst_parts.clear();
-                asst_meta = None;
+                builder.current_user = Some(UserMessage {
+                    created_ms: ts_ms,
+                    text,
+                });
+                builder.asst_parts.clear();
+                builder.asst_meta = None;
             }
 
             "assistant" => {
-                if asst_step_count > 0 {
-                    asst_parts.push(AssistantPart::StepBreak);
+                if builder.asst_step_count > 0 {
+                    builder.asst_parts.push(AssistantPart::StepBreak);
                 }
-                asst_step_count += 1;
+                builder.asst_step_count += 1;
 
                 let ts_ms = parse_timestamp_ms(v["timestamp"].as_str());
                 let msg = &v["message"];
@@ -277,7 +327,7 @@ fn parse_jsonl(path: &Path, session_id: &str) -> Result<Session> {
                 let model = msg["model"].as_str().map(String::from);
 
                 // Initialize or update assistant metadata
-                let meta = asst_meta.get_or_insert_with(|| AssistantMessage {
+                let meta = builder.asst_meta.get_or_insert_with(|| AssistantMessage {
                     created_ms: ts_ms,
                     ..Default::default()
                 });
@@ -294,30 +344,28 @@ fn parse_jsonl(path: &Path, session_id: &str) -> Result<Session> {
                             "text" => {
                                 let text = block["text"].as_str().unwrap_or("").to_string();
                                 if !text.is_empty() {
-                                    asst_parts.push(AssistantPart::Text(text));
+                                    builder.asst_parts.push(AssistantPart::Text(text));
                                 }
                             }
                             "thinking" => {
                                 let text = block["thinking"].as_str().unwrap_or("").to_string();
-                                asst_parts.push(AssistantPart::Thinking(
-                                    ThinkingBlock::Plaintext(text),
-                                ));
+                                builder
+                                    .asst_parts
+                                    .push(AssistantPart::Thinking(ThinkingBlock::Plaintext(text)));
                             }
                             "tool_use" => {
-                                let call_id =
-                                    block["id"].as_str().unwrap_or("").to_string();
-                                let tool_name =
-                                    block["name"].as_str().unwrap_or("").to_string();
+                                let call_id = block["id"].as_str().unwrap_or("").to_string();
+                                let tool_name = block["name"].as_str().unwrap_or("").to_string();
                                 let input = block["input"].clone();
-                                let idx = asst_parts.len();
-                                asst_parts.push(AssistantPart::ToolCall(ToolCall {
+                                let idx = builder.asst_parts.len();
+                                builder.asst_parts.push(AssistantPart::ToolCall(ToolCall {
                                     call_id: call_id.clone(),
                                     tool_name,
                                     input,
                                     output: None,
                                     is_error: false,
                                 }));
-                                pending_calls.insert(call_id, idx);
+                                builder.pending_calls.insert(call_id, idx);
                             }
                             _ => {}
                         }
@@ -337,14 +385,7 @@ fn parse_jsonl(path: &Path, session_id: &str) -> Result<Session> {
     }
 
     // Flush final turn
-    flush_turn(
-        &mut turns,
-        &mut current_user,
-        &mut asst_parts,
-        &mut asst_meta,
-        &mut pending_calls,
-        &mut asst_step_count,
-    );
+    builder.flush(&mut turns, &mut losses);
 
     if session_created_ms == i64::MAX {
         session_created_ms = 0;
