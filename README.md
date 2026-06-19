@@ -4,6 +4,18 @@
 
 # session-sync
 
+<p align="center">
+  <a href="https://github.com/Supernova1744/session-sync/actions/workflows/rust.yml"><img alt="CI" src="https://github.com/Supernova1744/session-sync/actions/workflows/rust.yml/badge.svg"></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
+  <a href="https://www.rust-lang.org/"><img alt="Rust" src="https://img.shields.io/badge/rust-1.70%2B-orange.svg"></a>
+  <a href="#platform-support"><img alt="Platform" src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20WSL2-lightgrey.svg"></a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/Supernova1744/session-sync/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/Supernova1744/session-sync?style=flat&label=%E2%98%85%20stars"></a>
+  <a href="https://github.com/Supernova1744/session-sync/graphs/traffic"><img alt="Views" src="https://hits.seeyoufarm.com/api/count/incr?count_bg=%234493F7&title_bg=%23555555&title=views&edge_flat=true"></a>
+</p>
+
 Migrate chat sessions between **Claude Code**, **VS Code Copilot Chat**, and **OpenCode** — in all six directions — without touching the source.
 
 ```
