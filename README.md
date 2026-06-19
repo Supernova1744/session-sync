@@ -12,8 +12,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Supernova1744/session-sync/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/Supernova1744/session-sync?style=flat&label=%E2%98%85%20stars"></a>
-  <a href="https://github.com/Supernova1744/session-sync/graphs/traffic"><img alt="Views" src="https://hits.seeyoufarm.com/api/count/incr?count_bg=%234493F7&title_bg=%23555555&title=views&edge_flat=true"></a>
+  <a href="https://github.com/Supernova1744/session-sync/stargazers"><img alt="Stars" src="https://badgen.net/github/stars/Supernova1744/session-sync?label=%E2%98%85%20stars"></a>
 </p>
 
 Migrate chat sessions between **Claude Code**, **VS Code Copilot Chat**, and **OpenCode** — in all six directions — without touching the source.
